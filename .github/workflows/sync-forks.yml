@@ -1,0 +1,152 @@
+name: Org Fork Syncer
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    env:
+      ORG: "repo-wayback"
+      UPSTREAM_BRANCH: "main"
+      REPO_FILTER_PREFIX: ""
+    steps:
+      - name: Checkout syncer repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup tools
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y jq
+
+      - name: Prepare
+        env:
+          PAT: ${{ secrets.PAT }}
+        run: |
+          if [ -z "$PAT" ]; then
+            echo "::error:: Secret PAT is empty. Please set secrets.PAT in this repo."
+            exit 1
+          fi
+          echo "PAT present."
+
+      - name: Get list of org repos (forks only)
+        id: list_repos
+        env:
+          ORG: ${{ env.ORG }}
+          PAT: ${{ secrets.PAT }}
+        run: |
+          REPOS_FILE="repos.txt"
+          jq -n '[]' > repos_list.json
+          while read -r r; do
+            owner=$(echo "$r" | cut -d '/' -f 1)
+            repo=$(echo "$r" | cut -d '/' -f 2)
+            parent_info=$(curl -s -H "Authorization: Bearer $PAT" "https://api.github.com/repos/$owner/$repo" | jq '{full_name:.full_name, name:.name, owner:.owner.login, parent:.parent.full_name}')
+            jq -c --argjson obj "$parent_info" '. + [$obj]' repos_list.json > /tmp/tmpj && mv /tmp/tmpj repos_list.json
+          done < $REPOS_FILE
+          echo "repos_file=repos_list.json" >> $GITHUB_OUTPUT
+          echo "Found repos:"
+          cat repos_list.json
+
+      - name: Sync loop
+        id: sync_loop
+        env:
+          ORG: ${{ env.ORG }}
+          UPSTREAM_BRANCH: ${{ env.UPSTREAM_BRANCH }}
+          REPO_FILTER_PREFIX: ${{ env.REPO_FILTER_PREFIX }}
+          PAT: ${{ secrets.PAT }}
+        run: |
+          REPOS_FILE="${{ steps.list_repos.outputs.repos_file }}"
+          if [ ! -f "$REPOS_FILE" ]; then
+            echo "No repos file found, nothing to do."
+            exit 0
+          fi
+
+          TIMESTAMP=$(date -u +"%Y%m%dT%H%M%SZ")
+          LOGPATH="logs/sync-${TIMESTAMP}.log"
+          mkdir -p logs
+          echo "Sync run at $TIMESTAMP" > $LOGPATH
+          echo "Org: $ORG" >> $LOGPATH
+          echo "" >> $LOGPATH
+
+          # Prepare notification content
+          DIVERGED_LIST=""
+          SUCCESS_LIST=""
+
+          jq -c '.[]' $REPOS_FILE | while read -r repo_info; do
+            full_name=$(echo "$repo_info" | jq -r '.full_name')
+            name=$(echo "$repo_info" | jq -r '.name')
+            owner=$(echo "$repo_info" | jq -r '.owner')
+            parent=$(echo "$repo_info" | jq -r '.parent')
+            # If GitHub didn't include parent info (rare), skip
+            if [ "$parent" = "null" ] || [ -z "$parent" ]; then
+              echo "Skipping $full_name: no parent info" | tee -a $LOGPATH
+              continue
+            fi
+            # parent like upstream_owner/upstream_repo
+            upstream_owner=$(echo "$parent" | cut -d '/' -f 1)
+            upstream_repo=$(echo "$parent" | cut -d '/' -f 2)
+
+            echo "Processing $full_name (upstream: $upstream_owner/$upstream_repo)" | tee -a $LOGPATH
+
+            COMPARE_URL="https://api.github.com/repos/${owner}/${name}/compare/${UPSTREAM_BRANCH}...${upstream_owner}:${UPSTREAM_BRANCH}"
+            cmp_resp=$(curl -s -H "Authorization: Bearer $PAT" -H "Accept: application/vnd.github+json" "$COMPARE_URL")
+            status=$(echo "$cmp_resp" | jq -r '.status // empty')
+            ahead_by=$(echo "$cmp_resp" | jq -r '.ahead_by // 0')
+            behind_by=$(echo "$cmp_resp" | jq -r '.behind_by // 0')
+
+            if [ -z "$status" ]; then
+              echo "  Failed to compare $full_name (maybe branch missing). Response:" >> "$LOGPATH"
+              echo "$cmp_resp" >> "$LOGPATH"
+              echo "" >> "$LOGPATH"
+              continue
+            fi
+
+            echo "  Compare status: $status (ahead_by=$ahead_by, behind_by=$behind_by)" | tee -a "$LOGPATH"
+
+            if [ "$status" = "behind" ] || [ "$status" = "identical" ]; then
+              # Safe to call merge-upstream
+              echo "Attempting merge-upstream for $owner/$name ..." | tee -a "$LOGPATH"
+              MU_URL="https://api.github.com/repos/${owner}/${name}/merge-upstream"
+              mu_resp=$(curl -s -w "\n%{http_code}" -X POST \
+                -H "Accept: application/vnd.github+json" \
+                -H "Authorization: Bearer $PAT" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                "$MU_URL" \
+                -d "{\"branch\": \"${UPSTREAM_BRANCH}\"}")
+              http_code=$(echo "$mu_resp" | tail -n 1)
+              body=$(echo "$mu_resp" | sed '$d')
+              if [ "$http_code" = "200" ] || [ "$http_code" = "201" ]; then
+                echo "  merge-upstream success for $owner/$name" | tee -a "$LOGPATH"
+                SUCCESS_LIST="${SUCCESS_LIST}\n- $owner/$name"
+              elif [ "$http_code" = "409" ]; then
+                echo "  merge-upstream reported conflict (409) for $owner/$name. Skipping." | tee -a "$LOGPATH"
+                DIVERGED_LIST="${DIVERGED_LIST}\n- $owner/$name (conflict during merge)"
+              else
+                echo "  merge-upstream failed for $owner/$name. HTTP ${http_code}. Response:" | tee -a "$LOGPATH"
+                echo "$body" | tee -a "$LOGPATH"
+                DIVERGED_LIST="${DIVERGED_LIST}\n- $owner/$name (merge error http ${http_code})"
+              fi
+            else
+              echo "  Skipping auto-sync for $owner/$name due to status=$status" | tee -a "$LOGPATH"
+              DIVERGED_LIST="${DIVERGED_LIST}\n- $owner/$name (status=${status}, ahead_by=${ahead_by}, behind_by=${behind_by})"
+            fi
+
+            echo "" >> "$LOGPATH"
+          done
+
+          # After loop: commit the log file into syncer repo
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add $LOGPATH
+          git commit -m "sync logs: $TIMESTAMP" || echo "No changes to commit for logs"
+          git push origin HEAD || echo "Pushed logs (or nothing to push)"
+
+          echo "Run complete. Log: $LOGPATH"
+        shell: bash
